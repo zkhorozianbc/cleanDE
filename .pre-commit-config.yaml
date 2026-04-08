@@ -4,6 +4,11 @@ repos:
     hooks:
       - id: check-yaml
       - id: end-of-file-fixer
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.6
+    hooks:
+      - id: ruff
+        args: [--fix]
   - repo: local
     hooks:
       - id: ty
