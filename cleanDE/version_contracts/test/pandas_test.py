@@ -5,6 +5,8 @@ import pytest
 
 from cleanDE.version_contracts.pandas_impl import (
     ContractError,
+    ContractSpec,
+    Verified,
     VersionError,
     _parse_version,
     check_version_constraint,
@@ -538,3 +540,316 @@ class TestVerifiedWithLockFile:
 
         result = double_val(pd.DataFrame({"id": [1, 2], "val": [10, 20]}))
         assert list(result["doubled"]) == [20, 40]
+
+
+# ── Verified wrapper ─────────────────────────────────────────────────
+
+
+class TestVerifiedWrapper:
+    def test_wraps_value(self) -> None:
+        df = pd.DataFrame({"a": [1, 2]})
+        v = Verified(df, frozenset({"check_a"}), {"pandas": "3.0.2"})
+        assert v.inner is df
+
+    def test_exposes_contracts(self) -> None:
+        v = Verified(42, frozenset({"check_a", "check_b"}), {})
+        assert v.contracts == frozenset({"check_a", "check_b"})
+
+    def test_exposes_versions(self) -> None:
+        v = Verified(42, frozenset(), {"pandas": "3.0.2"})
+        assert v.versions == {"pandas": "3.0.2"}
+
+    def test_versions_returns_copy(self) -> None:
+        v = Verified(42, frozenset(), {"pandas": "3.0.2"})
+        v.versions["hacked"] = "1.0.0"
+        assert "hacked" not in v.versions
+
+    def test_unsafe_bypasses_checks(self) -> None:
+        df = pd.DataFrame({"a": [1]})
+        v = Verified.unsafe(df)
+        assert v.inner is df
+        assert "__unsafe__" in v.contracts
+        assert v.versions == {}
+
+    def test_repr_contains_value_and_contracts(self) -> None:
+        v = Verified(42, frozenset({"check"}), {})
+        assert "Verified(42" in repr(v)
+        assert "check" in repr(v)
+
+
+# ── ContractSpec ─────────────────────────────────────────────────────
+
+
+class TestContractSpec:
+    def test_construction_validates_versions(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+        )
+        assert spec.name == "test"
+        assert spec.checked_versions == {"pandas": "3.0.2"}
+
+    def test_construction_fails_on_bad_version(self) -> None:
+        versions = {"pandas": "2.0.0"}
+        with pytest.raises(VersionError):
+            ContractSpec(
+                name="test",
+                require={"pandas": ">=3.0.0"},
+                lock_versions=versions,
+            )
+
+    def test_construction_fails_on_missing_package(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        with pytest.raises(VersionError):
+            ContractSpec(
+                name="test",
+                require={"pandas": ">=3.0.0"},
+                lock_versions=versions,
+            )
+
+    def test_verify_returns_verified(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df, **kw: non_empty(df),
+            },
+        )
+        df = pd.DataFrame({"a": [1, 2, 3]})
+        result = spec.verify(df)
+        assert isinstance(result, Verified)
+        assert result.inner is df
+        assert "non_empty" in result.contracts
+        assert result.versions == {"pandas": "3.0.2"}
+
+    def test_verify_fails_on_precondition(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df, **kw: non_empty(df),
+            },
+        )
+        with pytest.raises(ContractError, match="non_empty"):
+            spec.verify(pd.DataFrame())
+
+    def test_verify_with_context(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "has_key_cols": lambda df, **kw: columns_present(df, kw["keys"]),
+            },
+        )
+        df = pd.DataFrame({"id": [1], "val": [2]})
+        result = spec.verify(df, keys=["id"])
+        assert result.inner is df
+
+    def test_check_output_returns_verified(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_cols": lambda df: columns_present(df, ["a", "b"]),
+            },
+        )
+        df = pd.DataFrame({"a": [1], "b": [2]})
+        result = spec.check_output(df)
+        assert isinstance(result, Verified)
+        assert "has_cols" in result.contracts
+
+    def test_check_output_fails(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_cols": lambda df: columns_present(df, ["a", "b", "c"]),
+            },
+        )
+        with pytest.raises(ContractError, match="has_cols"):
+            spec.check_output(pd.DataFrame({"a": [1], "b": [2]}))
+
+    def test_wrap_returns_verified(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df: non_empty(df),
+            },
+            postconditions={
+                "has_out": lambda result: columns_present(result, ["a", "out"]),
+            },
+        )
+
+        def add_column(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            df["out"] = df["a"] * 2
+            return df
+
+        safe_fn = spec.wrap(add_column)
+        result = safe_fn(pd.DataFrame({"a": [1, 2]}))
+        assert isinstance(result, Verified)
+        assert list(result.inner["out"]) == [2, 4]
+        assert "non_empty" in result.contracts
+        assert "has_out" in result.contracts
+
+    def test_wrap_precondition_fails(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df: non_empty(df),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda df: df)
+        with pytest.raises(ContractError, match="Precondition.*non_empty"):
+            safe_fn(pd.DataFrame())
+
+    def test_wrap_postcondition_fails(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_c": lambda result: columns_present(result, ["c"]),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda: pd.DataFrame({"a": [1]}))
+        with pytest.raises(ContractError, match="Postcondition.*has_c"):
+            safe_fn()
+
+    def test_wrap_preserves_function_name(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+        )
+
+        def my_function() -> pd.DataFrame:
+            return pd.DataFrame()
+
+        safe_fn = spec.wrap(my_function)
+        assert safe_fn.__name__ == "my_function"
+
+    def test_wrap_attaches_spec(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+        )
+
+        safe_fn = spec.wrap(lambda: None)
+        assert safe_fn.__contract_spec__ is spec
+
+    def test_no_preconditions_or_postconditions(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="test",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+        )
+
+        safe_fn = spec.wrap(lambda x: x + 1)
+        result = safe_fn(5)
+        assert isinstance(result, Verified)
+        assert result.inner == 6
+        assert result.contracts == frozenset()
+
+
+# ── Safe/unsafe distinction ──────────────────────────────────────────
+
+
+class TestSafeUnsafeDistinction:
+    """Demonstrate the Rust-like safe/unsafe boundary."""
+
+    def test_safe_path_through_spec(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="transform",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df: non_empty(df),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda df: df.copy())
+        result = safe_fn(pd.DataFrame({"a": [1]}))
+
+        assert isinstance(result, Verified)
+        assert "__unsafe__" not in result.contracts
+        assert "non_empty" in result.contracts
+
+    def test_unsafe_path_is_explicit(self) -> None:
+        df = pd.DataFrame({"a": [1]})
+        result = Verified.unsafe(df)
+
+        assert isinstance(result, Verified)
+        assert "__unsafe__" in result.contracts
+        assert result.versions == {}
+
+    def test_safe_and_unsafe_are_distinguishable(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        spec = ContractSpec(
+            name="check",
+            require={"pandas": ">=3.0.0"},
+            lock_versions=versions,
+            preconditions={"exists": lambda df: non_empty(df)},
+        )
+
+        safe = spec.verify(pd.DataFrame({"a": [1]}))
+        unsafe = Verified.unsafe(pd.DataFrame({"a": [1]}))
+
+        assert "__unsafe__" not in safe.contracts
+        assert "__unsafe__" in unsafe.contracts
+        assert safe.versions != unsafe.versions
+
+    def test_spec_wrap_end_to_end_with_lock_file(self, lock_path: Path) -> None:
+        versions = parse_lock_versions(lock_path)
+
+        spec = ContractSpec(
+            name="bitemporal",
+            require={"pandas": ">=3.0.0,<4.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda df: non_empty(df),
+                "has_inputs": lambda df: columns_present(df, ["id", "val"]),
+            },
+            postconditions={
+                "has_output": lambda r: columns_present(r, ["id", "val", "doubled"]),
+            },
+        )
+
+        def double_val(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            df["doubled"] = df["val"] * 2
+            return df
+
+        safe_fn = spec.wrap(double_val)
+        result = safe_fn(pd.DataFrame({"id": [1, 2], "val": [10, 20]}))
+
+        assert isinstance(result, Verified)
+        assert list(result.inner["doubled"]) == [20, 40]
+        assert result.contracts == frozenset({"non_empty", "has_inputs", "has_output"})
+        assert result.versions == {"pandas": "3.0.2"}

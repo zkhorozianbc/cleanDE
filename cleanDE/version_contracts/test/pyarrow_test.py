@@ -5,6 +5,8 @@ import pytest
 
 from cleanDE.version_contracts.pyarrow_impl import (
     ContractError,
+    ContractSpec,
+    Verified,
     VersionError,
     _parse_version,
     check_version_constraint,
@@ -435,3 +437,319 @@ class TestVerifiedWithLockFile:
         table = pa.table({"id": [1, 2], "val": [10, 20]})
         result = double_val(table)
         assert result.column("doubled").to_pylist() == [20, 40]
+
+
+# ── Verified wrapper ─────────────────────────────────────────────────
+
+
+class TestVerifiedWrapper:
+    def test_wraps_value(self) -> None:
+        table = pa.table({"a": [1, 2]})
+        v = Verified(table, frozenset({"check_a"}), {"pyarrow": "23.0.1"})
+        assert v.inner is table
+
+    def test_exposes_contracts(self) -> None:
+        v = Verified(42, frozenset({"check_a", "check_b"}), {})
+        assert v.contracts == frozenset({"check_a", "check_b"})
+
+    def test_exposes_versions(self) -> None:
+        v = Verified(42, frozenset(), {"pyarrow": "23.0.1"})
+        assert v.versions == {"pyarrow": "23.0.1"}
+
+    def test_versions_returns_copy(self) -> None:
+        v = Verified(42, frozenset(), {"pyarrow": "23.0.1"})
+        v.versions["hacked"] = "1.0.0"
+        assert "hacked" not in v.versions
+
+    def test_unsafe_bypasses_checks(self) -> None:
+        table = pa.table({"a": [1]})
+        v = Verified.unsafe(table)
+        assert v.inner is table
+        assert "__unsafe__" in v.contracts
+        assert v.versions == {}
+
+    def test_repr_contains_value_and_contracts(self) -> None:
+        v = Verified(42, frozenset({"check"}), {})
+        assert "Verified(42" in repr(v)
+        assert "check" in repr(v)
+
+
+# ── ContractSpec ─────────────────────────────────────────────────────
+
+
+class TestContractSpec:
+    def test_construction_validates_versions(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+        )
+        assert spec.name == "test"
+        assert spec.checked_versions == {"pyarrow": "23.0.1"}
+
+    def test_construction_fails_on_bad_version(self) -> None:
+        versions = {"pyarrow": "10.0.0"}
+        with pytest.raises(VersionError):
+            ContractSpec(
+                name="test",
+                require={"pyarrow": ">=14.0.0"},
+                lock_versions=versions,
+            )
+
+    def test_construction_fails_on_missing_package(self) -> None:
+        versions = {"pandas": "3.0.2"}
+        with pytest.raises(VersionError):
+            ContractSpec(
+                name="test",
+                require={"pyarrow": ">=14.0.0"},
+                lock_versions=versions,
+            )
+
+    def test_verify_returns_verified(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table, **kw: non_empty(table),
+            },
+        )
+        table = pa.table({"a": [1, 2, 3]})
+        result = spec.verify(table)
+        assert isinstance(result, Verified)
+        assert result.inner is table
+        assert "non_empty" in result.contracts
+        assert result.versions == {"pyarrow": "23.0.1"}
+
+    def test_verify_fails_on_precondition(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table, **kw: non_empty(table),
+            },
+        )
+        empty = pa.table({"a": pa.array([], type=pa.int64())})
+        with pytest.raises(ContractError, match="non_empty"):
+            spec.verify(empty)
+
+    def test_verify_with_context(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "has_key_cols": lambda table, **kw: columns_present(table, kw["keys"]),
+            },
+        )
+        table = pa.table({"id": [1], "val": [2]})
+        result = spec.verify(table, keys=["id"])
+        assert result.inner is table
+
+    def test_check_output_returns_verified(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_cols": lambda table: columns_present(table, ["a", "b"]),
+            },
+        )
+        table = pa.table({"a": [1], "b": [2]})
+        result = spec.check_output(table)
+        assert isinstance(result, Verified)
+        assert "has_cols" in result.contracts
+
+    def test_check_output_fails(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_cols": lambda table: columns_present(table, ["a", "b", "c"]),
+            },
+        )
+        with pytest.raises(ContractError, match="has_cols"):
+            spec.check_output(pa.table({"a": [1], "b": [2]}))
+
+    def test_wrap_returns_verified(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table: non_empty(table),
+            },
+            postconditions={
+                "has_out": lambda result: columns_present(result, ["a", "doubled"]),
+            },
+        )
+
+        def double_col(table: pa.Table) -> pa.Table:
+            import pyarrow.compute as pc
+
+            return table.append_column("doubled", pc.multiply(table.column("a"), 2))
+
+        safe_fn = spec.wrap(double_col)
+        result = safe_fn(pa.table({"a": [1, 2]}))
+        assert isinstance(result, Verified)
+        assert result.inner.column("doubled").to_pylist() == [2, 4]
+        assert "non_empty" in result.contracts
+        assert "has_out" in result.contracts
+
+    def test_wrap_precondition_fails(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table: non_empty(table),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda table: table)
+        empty = pa.table({"a": pa.array([], type=pa.int64())})
+        with pytest.raises(ContractError, match="Precondition.*non_empty"):
+            safe_fn(empty)
+
+    def test_wrap_postcondition_fails(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            postconditions={
+                "has_c": lambda result: columns_present(result, ["c"]),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda: pa.table({"a": [1]}))
+        with pytest.raises(ContractError, match="Postcondition.*has_c"):
+            safe_fn()
+
+    def test_wrap_preserves_function_name(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+        )
+
+        def my_function() -> pa.Table:
+            return pa.table({"a": [1]})
+
+        safe_fn = spec.wrap(my_function)
+        assert safe_fn.__name__ == "my_function"
+
+    def test_wrap_attaches_spec(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+        )
+
+        safe_fn = spec.wrap(lambda: None)
+        assert safe_fn.__contract_spec__ is spec
+
+    def test_no_preconditions_or_postconditions(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="test",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+        )
+
+        safe_fn = spec.wrap(lambda x: x + 1)
+        result = safe_fn(5)
+        assert isinstance(result, Verified)
+        assert result.inner == 6
+        assert result.contracts == frozenset()
+
+
+# ── Safe/unsafe distinction ──────────────────────────────────────────
+
+
+class TestSafeUnsafeDistinction:
+    """Demonstrate the Rust-like safe/unsafe boundary."""
+
+    def test_safe_path_through_spec(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="transform",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table: non_empty(table),
+            },
+        )
+
+        safe_fn = spec.wrap(lambda table: table)
+        result = safe_fn(pa.table({"a": [1]}))
+
+        assert isinstance(result, Verified)
+        assert "__unsafe__" not in result.contracts
+        assert "non_empty" in result.contracts
+
+    def test_unsafe_path_is_explicit(self) -> None:
+        table = pa.table({"a": [1]})
+        result = Verified.unsafe(table)
+
+        assert isinstance(result, Verified)
+        assert "__unsafe__" in result.contracts
+        assert result.versions == {}
+
+    def test_safe_and_unsafe_are_distinguishable(self) -> None:
+        versions = {"pyarrow": "23.0.1"}
+        spec = ContractSpec(
+            name="check",
+            require={"pyarrow": ">=14.0.0"},
+            lock_versions=versions,
+            preconditions={"exists": lambda table: non_empty(table)},
+        )
+
+        safe = spec.verify(pa.table({"a": [1]}))
+        unsafe = Verified.unsafe(pa.table({"a": [1]}))
+
+        assert "__unsafe__" not in safe.contracts
+        assert "__unsafe__" in unsafe.contracts
+        assert safe.versions != unsafe.versions
+
+    def test_spec_wrap_end_to_end_with_lock_file(self, lock_path: Path) -> None:
+        import pyarrow.compute as pc
+
+        versions = parse_lock_versions(lock_path)
+
+        spec = ContractSpec(
+            name="bitemporal",
+            require={"pyarrow": ">=23.0.0,<24.0.0"},
+            lock_versions=versions,
+            preconditions={
+                "non_empty": lambda table: non_empty(table),
+                "has_inputs": lambda table: columns_present(table, ["id", "val"]),
+            },
+            postconditions={
+                "has_output": lambda r: columns_present(r, ["id", "val", "doubled"]),
+            },
+        )
+
+        def double_val(table: pa.Table) -> pa.Table:
+            doubled = pc.multiply(table.column("val"), 2)
+            return table.append_column("doubled", doubled)
+
+        safe_fn = spec.wrap(double_val)
+        result = safe_fn(pa.table({"id": [1, 2], "val": [10, 20]}))
+
+        assert isinstance(result, Verified)
+        assert result.inner.column("doubled").to_pylist() == [20, 40]
+        assert result.contracts == frozenset({"non_empty", "has_inputs", "has_output"})
+        assert result.versions == {"pyarrow": "23.0.1"}

@@ -2,44 +2,42 @@
 Version-aware contracts for pyarrow functions.
 
 Bridges the gap between your uv.lock dependency versions and your code's
-runtime assumptions. Enforces preconditions and postconditions that can
-vary based on which dependency versions are locked.
+runtime assumptions.  Uses a Rust-inspired safe/unsafe model where
+verified data is wrapped in a distinct type.
 
-Three core capabilities:
+Core capabilities:
   1. Lock file parsing — extract pinned versions from uv.lock
-  2. Version-guarded contracts — a decorator that enforces pre/post
-     conditions and fails fast when dependency versions fall outside
-     declared ranges
-  3. Version-conditional dispatch — select values or implementations
-     based on the locked version of a dependency
+  2. Verified[T] — a Rust-style newtype wrapper proving data passed checks
+  3. ContractSpec — a metaprogram that generates verification pipelines
+  4. @verified — a lightweight decorator for simple version + contract guards
+  5. version_switch — select implementations based on locked versions
 
-Usage:
+Usage (ContractSpec — the metaprogram):
     from pathlib import Path
     from cleanDE.version_contracts.pyarrow_impl import (
-        parse_lock_versions,
-        verified,
-        version_switch,
-        non_empty,
-        columns_present,
+        parse_lock_versions, ContractSpec, Verified, non_empty, columns_present,
     )
 
     versions = parse_lock_versions(Path("uv.lock"))
 
-    @verified(
+    spec = ContractSpec(
+        name="transform",
         require={"pyarrow": ">=23.0.0"},
         lock_versions=versions,
-        pre=lambda table, **kw: non_empty(table),
-        post=lambda result: columns_present(result, ["id", "value"]),
+        preconditions={"non_empty": lambda t: non_empty(t)},
+        postconditions={"has_output": lambda r: columns_present(r, ["out"])},
     )
-    def transform(table: pa.Table) -> pa.Table:
-        ...
+
+    safe_transform = spec.wrap(transform)    # returns Verified[Table]
+    result = safe_transform(my_table)        # result.inner is the Table
+    raw = Verified.unsafe(my_table)          # explicit unsafe bypass
 """
 
 import functools
 import importlib.metadata
 import tomllib
 from pathlib import Path
-from typing import Any, Callable, ParamSpec, TypeVar
+from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
 import pyarrow as pa
 
@@ -57,6 +55,82 @@ class VersionError(Exception):
 
 class ContractError(Exception):
     """Raised when a pre- or postcondition is violated at call time."""
+
+
+# ── Verified wrapper (Rust-inspired newtype) ─────────────────────────
+
+
+class Verified(Generic[T]):
+    """A value that has passed contract verification.
+
+    Inspired by Rust's newtype pattern and safe/unsafe distinction.
+    Obtaining a Verified[T] requires either:
+      - Passing through ContractSpec.verify() or a wrapped function (safe)
+      - Calling Verified.unsafe() to explicitly bypass checks (unsafe)
+
+    Functions that accept Verified[T] encode at the type level that they
+    require pre-checked input.  Passing unverified data is a type error,
+    not a runtime surprise.
+
+    Parameters
+    ----------
+    inner : T
+        The value being wrapped.
+    contracts : frozenset[str]
+        Names of the contracts that were verified.
+    versions : dict[str, str]
+        Locked dependency versions at verification time.
+    """
+
+    __slots__ = ("_inner", "_contracts", "_versions")
+
+    def __init__(
+        self,
+        inner: T,
+        contracts: frozenset[str],
+        versions: dict[str, str],
+    ) -> None:
+        self._inner = inner
+        self._contracts = contracts
+        self._versions = versions
+
+    @property
+    def inner(self) -> T:
+        """The underlying verified value."""
+        return self._inner
+
+    @property
+    def contracts(self) -> frozenset[str]:
+        """Names of the contracts that were checked."""
+        return self._contracts
+
+    @property
+    def versions(self) -> dict[str, str]:
+        """Locked dependency versions at verification time (copy)."""
+        return dict(self._versions)
+
+    @staticmethod
+    def unsafe(value: T) -> "Verified[T]":  # type: ignore[misc]
+        """Bypass verification.  Caller assumes responsibility.
+
+        Analogous to Rust's ``unsafe`` block: explicitly marks a value as
+        trusted without running any checks.  The ``__unsafe__`` marker in
+        ``.contracts`` makes these bypass points visible during audits.
+
+        Parameters
+        ----------
+        value : T
+            The value to mark as verified without checking.
+
+        Returns
+        -------
+        Verified[T]
+            Wrapper with contracts={"__unsafe__"} and empty versions.
+        """
+        return Verified(value, frozenset({"__unsafe__"}), {})
+
+    def __repr__(self) -> str:
+        return f"Verified({self._inner!r}, contracts={self._contracts})"
 
 
 # ── Lock file parsing ────────────────────────────────────────────────
@@ -342,6 +416,191 @@ def version_switch(
         f"No branch matches {package}=={version}. "
         f"Defined branches: {list(branches.keys())}"
     )
+
+
+# ── ContractSpec (the metaprogram) ───────────────────────────────────
+
+
+class ContractSpec:
+    """A specification that generates verification pipelines.
+
+    This is the metaprogram: instead of writing imperative checks, you
+    declare a specification — name, version requirements, named pre- and
+    postconditions — and the spec *generates* functions that enforce it.
+
+    Mirrors Rust's trait system: define what guarantees you need once,
+    then ``.wrap()`` generates the enforcement code for each use site.
+    Version requirements are validated at construction time (fail fast),
+    not at call time.
+
+    Parameters
+    ----------
+    name : str
+        Human-readable name for this contract (appears in error messages).
+    require : dict[str, str]
+        Package version constraints checked at construction time.
+    lock_versions : dict[str, str]
+        Locked versions from parse_lock_versions().
+    preconditions : dict[str, Callable[..., bool]] | None
+        Named checks run on inputs.  Each callable receives the same
+        arguments as the target function.  Keys are contract names that
+        appear in Verified.contracts.
+    postconditions : dict[str, Callable[..., bool]] | None
+        Named checks run on the return value.  Each callable receives the
+        return value as its sole argument.  Keys are contract names.
+
+    Raises
+    ------
+    VersionError
+        At construction time, if any version requirement is unmet.
+    """
+
+    __slots__ = (
+        "_name", "_require", "_lock_versions",
+        "_preconditions", "_postconditions",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        require: dict[str, str],
+        lock_versions: dict[str, str],
+        preconditions: dict[str, Callable[..., bool]] | None = None,
+        postconditions: dict[str, Callable[..., bool]] | None = None,
+    ) -> None:
+        for pkg, constraint in require.items():
+            version = lock_versions.get(pkg)
+            if version is None:
+                raise VersionError(
+                    f"Package {pkg!r} not found in lock versions"
+                )
+            if not check_version_constraint(version, constraint):
+                raise VersionError(
+                    f"Package {pkg!r} locked at {version}, "
+                    f"but {constraint!r} is required"
+                )
+        self._name = name
+        self._require = require
+        self._lock_versions = lock_versions
+        self._preconditions = preconditions or {}
+        self._postconditions = postconditions or {}
+
+    @property
+    def name(self) -> str:
+        """The contract spec's human-readable name."""
+        return self._name
+
+    @property
+    def checked_versions(self) -> dict[str, str]:
+        """Locked versions for all required packages."""
+        return {pkg: self._lock_versions[pkg] for pkg in self._require}
+
+    def verify(self, value: T, **context: Any) -> Verified[T]:
+        """Run preconditions on a value and wrap it as Verified.
+
+        Like a Rust borrow-check boundary: if this returns without
+        raising, the data satisfies all declared preconditions.
+
+        Parameters
+        ----------
+        value : T
+            The value to verify.  Passed as the first positional argument
+            to each precondition callable.
+        **context
+            Additional keyword arguments forwarded to each precondition.
+
+        Returns
+        -------
+        Verified[T]
+            Wrapper whose ``.contracts`` lists the preconditions checked.
+
+        Raises
+        ------
+        ContractError
+            If any precondition returns False.
+        """
+        for check_name, check_fn in self._preconditions.items():
+            if not check_fn(value, **context):
+                raise ContractError(
+                    f"[{self._name}] Precondition {check_name!r} failed"
+                )
+        return Verified(
+            value,
+            frozenset(self._preconditions.keys()),
+            self.checked_versions,
+        )
+
+    def check_output(self, value: T) -> Verified[T]:
+        """Run postconditions on a value and wrap it as Verified.
+
+        Parameters
+        ----------
+        value : T
+            The output value to check.
+
+        Returns
+        -------
+        Verified[T]
+            Wrapper whose ``.contracts`` lists the postconditions checked.
+
+        Raises
+        ------
+        ContractError
+            If any postcondition returns False.
+        """
+        for check_name, check_fn in self._postconditions.items():
+            if not check_fn(value):
+                raise ContractError(
+                    f"[{self._name}] Postcondition {check_name!r} failed"
+                )
+        return Verified(
+            value,
+            frozenset(self._postconditions.keys()),
+            self.checked_versions,
+        )
+
+    def wrap(self, fn: Callable[P, R]) -> Callable[P, "Verified[R]"]:
+        """Generate a verified wrapper around a function.
+
+        The returned function:
+          1. Runs all preconditions on the input arguments
+          2. Calls the original function
+          3. Runs all postconditions on the return value
+          4. Returns Verified[R] with the full set of checked contracts
+
+        Parameters
+        ----------
+        fn : Callable[P, R]
+            The function to wrap.
+
+        Returns
+        -------
+        Callable[P, Verified[R]]
+            A wrapper that returns verified results.
+        """
+        @functools.wraps(fn)
+        def wrapper(*args: P.args, **kwargs: P.kwargs) -> Verified[R]:
+            for check_name, check_fn in self._preconditions.items():
+                if not check_fn(*args, **kwargs):
+                    raise ContractError(
+                        f"[{self._name}] Precondition {check_name!r} "
+                        f"failed for {fn.__qualname__}"
+                    )
+            result = fn(*args, **kwargs)
+            for check_name, check_fn in self._postconditions.items():
+                if not check_fn(result):
+                    raise ContractError(
+                        f"[{self._name}] Postcondition {check_name!r} "
+                        f"failed for {fn.__qualname__}"
+                    )
+            all_checks = frozenset(
+                list(self._preconditions.keys())
+                + list(self._postconditions.keys())
+            )
+            return Verified(result, all_checks, self.checked_versions)
+
+        wrapper.__contract_spec__ = self  # type: ignore[attr-defined]
+        return wrapper
 
 
 # ── Table contract predicates ────────────────────────────────────────
