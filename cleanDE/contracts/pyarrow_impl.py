@@ -1,36 +1,40 @@
 """
-Version-aware contracts for pandas functions.
+Data contracts for pyarrow Tables.
 
-Bridges the gap between your uv.lock dependency versions and your code's
-runtime assumptions.  Uses a Rust-inspired safe/unsafe model where
-verified data is wrapped in a distinct type.
+Lightweight runtime contracts that validate what your functions expect and
+guarantee.  Declare preconditions and postconditions once, get fast failures
+when assumptions break.  Optionally tie contracts to the dependency versions
+in your uv.lock file so version upgrades can't silently break your code.
 
-Core capabilities:
-  1. Lock file parsing — extract pinned versions from uv.lock
-  2. Verified[T] — a Rust-style newtype wrapper proving data passed checks
-  3. ContractSpec — a metaprogram that generates verification pipelines
-  4. @verified — a lightweight decorator for simple version + contract guards
-  5. version_switch — select implementations based on locked versions
-
-Usage (ContractSpec — the metaprogram):
-    from pathlib import Path
-    from cleanDE.version_contracts.pandas_impl import (
-        parse_lock_versions, ContractSpec, Verified, non_empty, columns_present,
+Use case 1 — pure data contracts (no lock file needed):
+    from cleanDE.contracts.pyarrow_impl import (
+        ContractSpec, non_empty, columns_present,
     )
-
-    versions = parse_lock_versions(Path("uv.lock"))
 
     spec = ContractSpec(
-        name="transform",
-        require={"pandas": ">=3.0.0"},
-        lock_versions=versions,
-        preconditions={"non_empty": lambda df: non_empty(df)},
+        name="my_transform",
+        preconditions={"non_empty": lambda t: non_empty(t)},
         postconditions={"has_output": lambda r: columns_present(r, ["out"])},
     )
+    safe_fn = spec.wrap(transform)       # returns Verified[Table]
+    result = safe_fn(table)              # result.inner is the Table
 
-    safe_transform = spec.wrap(transform)    # returns Verified[DataFrame]
-    result = safe_transform(my_df)           # result.inner is the DataFrame
-    raw = Verified.unsafe(my_df)             # explicit unsafe bypass
+Use case 2 — version-guarded contracts:
+    from pathlib import Path
+
+    versions = parse_lock_versions(Path("uv.lock"))
+    spec = ContractSpec(
+        name="my_transform",
+        require={"pyarrow": ">=23.0.0"},
+        lock_versions=versions,
+        preconditions={"non_empty": lambda t: non_empty(t)},
+    )
+    # Fails at construction time if pyarrow < 23.0.0 in lock file
+
+Use case 3 — safe/unsafe boundary (Rust-inspired):
+    verified_table = spec.verify(raw_table)  # safe: contracts checked
+    raw = Verified.unsafe(raw_table)         # unsafe: explicitly bypassed
+    # Both are Verified[Table], but .contracts tells you which path
 """
 
 import functools
@@ -39,7 +43,7 @@ import tomllib
 from pathlib import Path
 from typing import Any, Callable, Generic, ParamSpec, TypeVar
 
-import pandas as pd
+import pyarrow as pa
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -203,9 +207,9 @@ def check_version_constraint(version: str, constraint: str) -> bool:
     Parameters
     ----------
     version : str
-        The version to check (e.g. "3.0.2").
+        The version to check (e.g. "23.0.1").
     constraint : str
-        One or more comma-separated version constraints (e.g. ">=3.0.0,<4.0").
+        One or more comma-separated version constraints (e.g. ">=14.0.0,<24.0").
 
     Returns
     -------
@@ -286,24 +290,24 @@ def detect_drift(
 
 
 def verified(
-    require: dict[str, str],
-    lock_versions: dict[str, str],
+    require: dict[str, str] | None = None,
+    lock_versions: dict[str, str] | None = None,
     pre: Callable[..., bool] | None = None,
     post: Callable[..., bool] | None = None,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Decorator that enforces version requirements and data contracts.
+    """Decorator that enforces data contracts with optional version guards.
 
-    At decoration time, validates that every package in *require* exists in
-    *lock_versions* and satisfies its constraint.  At call time, runs optional
-    *pre* and *post* checks around the wrapped function.
+    Use with just *pre*/*post* for pure data contracts, or add *require* and
+    *lock_versions* to also validate dependency versions at decoration time.
 
     Parameters
     ----------
-    require : dict[str, str]
-        Mapping of package names to version constraints
-        (e.g. {"pandas": ">=3.0.0"}).
-    lock_versions : dict[str, str]
-        Locked versions from parse_lock_versions().
+    require : dict[str, str] | None
+        Package version constraints (e.g. {"pyarrow": ">=23.0.0"}).
+        Optional — omit for pure data contracts.
+    lock_versions : dict[str, str] | None
+        Locked versions from parse_lock_versions().  Required when
+        *require* is specified.
     pre : Callable[..., bool] | None
         Precondition checked before every call.  Receives the same positional
         and keyword arguments as the decorated function.  Must return True
@@ -322,11 +326,17 @@ def verified(
     VersionError
         At decoration time, if a version requirement is not met or a required
         package is missing from the lock versions.
+    ValueError
+        If *require* is specified without *lock_versions*.
     ContractError
         At call time, if a pre- or postcondition fails.
     """
-    for pkg, constraint in require.items():
-        version = lock_versions.get(pkg)
+    _require = require or {}
+    _lock_versions = lock_versions or {}
+    if _require and not _lock_versions:
+        raise ValueError("lock_versions must be provided when require is specified")
+    for pkg, constraint in _require.items():
+        version = _lock_versions.get(pkg)
         if version is None:
             raise VersionError(
                 f"Package {pkg!r} not found in lock versions"
@@ -351,9 +361,9 @@ def verified(
                 )
             return result
 
-        wrapper.__version_requirements__ = require  # type: ignore[attr-defined]
+        wrapper.__version_requirements__ = _require  # type: ignore[attr-defined]
         wrapper.__locked_versions__ = {  # type: ignore[attr-defined]
-            pkg: lock_versions.get(pkg) for pkg in require
+            pkg: _lock_versions.get(pkg) for pkg in _require
         }
         return wrapper
 
@@ -425,22 +435,24 @@ class ContractSpec:
     """A specification that generates verification pipelines.
 
     This is the metaprogram: instead of writing imperative checks, you
-    declare a specification — name, version requirements, named pre- and
-    postconditions — and the spec *generates* functions that enforce it.
+    declare a specification — name, named pre/postconditions, and
+    optional version requirements — and the spec *generates* functions
+    that enforce it.
 
-    Mirrors Rust's trait system: define what guarantees you need once,
-    then ``.wrap()`` generates the enforcement code for each use site.
-    Version requirements are validated at construction time (fail fast),
-    not at call time.
+    Use with just preconditions/postconditions for pure data contracts.
+    Add *require* and *lock_versions* to also guard against dependency
+    version changes.
 
     Parameters
     ----------
     name : str
         Human-readable name for this contract (appears in error messages).
-    require : dict[str, str]
+    require : dict[str, str] | None
         Package version constraints checked at construction time.
-    lock_versions : dict[str, str]
-        Locked versions from parse_lock_versions().
+        Optional — omit for pure data contracts.
+    lock_versions : dict[str, str] | None
+        Locked versions from parse_lock_versions().  Required when
+        *require* is specified.
     preconditions : dict[str, Callable[..., bool]] | None
         Named checks run on inputs.  Each callable receives the same
         arguments as the target function.  Keys are contract names that
@@ -453,6 +465,8 @@ class ContractSpec:
     ------
     VersionError
         At construction time, if any version requirement is unmet.
+    ValueError
+        If *require* is specified without *lock_versions*.
     """
 
     __slots__ = (
@@ -463,13 +477,17 @@ class ContractSpec:
     def __init__(
         self,
         name: str,
-        require: dict[str, str],
-        lock_versions: dict[str, str],
+        require: dict[str, str] | None = None,
+        lock_versions: dict[str, str] | None = None,
         preconditions: dict[str, Callable[..., bool]] | None = None,
         postconditions: dict[str, Callable[..., bool]] | None = None,
     ) -> None:
-        for pkg, constraint in require.items():
-            version = lock_versions.get(pkg)
+        _require = require or {}
+        _lock_versions = lock_versions or {}
+        if _require and not _lock_versions:
+            raise ValueError("lock_versions must be provided when require is specified")
+        for pkg, constraint in _require.items():
+            version = _lock_versions.get(pkg)
             if version is None:
                 raise VersionError(
                     f"Package {pkg!r} not found in lock versions"
@@ -480,8 +498,8 @@ class ContractSpec:
                     f"but {constraint!r} is required"
                 )
         self._name = name
-        self._require = require
-        self._lock_versions = lock_versions
+        self._require = _require
+        self._lock_versions = _lock_versions
         self._preconditions = preconditions or {}
         self._postconditions = postconditions or {}
 
@@ -603,16 +621,16 @@ class ContractSpec:
         return wrapper
 
 
-# ── DataFrame contract predicates ────────────────────────────────────
+# ── Table contract predicates ────────────────────────────────────────
 
 
-def columns_present(df: pd.DataFrame, columns: list[str]) -> bool:
-    """Check that every column name in *columns* exists in the DataFrame.
+def columns_present(table: pa.Table, columns: list[str]) -> bool:
+    """Check that every column name in *columns* exists in the Table.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
     columns : list[str]
         Expected column names.
 
@@ -621,16 +639,16 @@ def columns_present(df: pd.DataFrame, columns: list[str]) -> bool:
     bool
         True if all columns are present.
     """
-    return all(c in df.columns for c in columns)
+    return all(c in table.column_names for c in columns)
 
 
-def no_nulls_in(df: pd.DataFrame, columns: list[str]) -> bool:
+def no_nulls_in(table: pa.Table, columns: list[str]) -> bool:
     """Check that the specified columns contain no null values.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
     columns : list[str]
         Columns to inspect for nulls.
 
@@ -639,16 +657,16 @@ def no_nulls_in(df: pd.DataFrame, columns: list[str]) -> bool:
     bool
         True if none of the specified columns contain nulls.
     """
-    return not df[columns].isna().any().any()
+    return all(table.column(c).null_count == 0 for c in columns)
 
 
-def unique_on(df: pd.DataFrame, columns: list[str]) -> bool:
+def unique_on(table: pa.Table, columns: list[str]) -> bool:
     """Check that the specified columns form a unique key.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
     columns : list[str]
         Columns that should jointly be unique.
 
@@ -657,32 +675,34 @@ def unique_on(df: pd.DataFrame, columns: list[str]) -> bool:
     bool
         True if no duplicate rows exist on the given columns.
     """
-    return not df.duplicated(subset=columns).any()
+    sub = table.select(columns)
+    grouped = sub.group_by(columns).aggregate([])
+    return grouped.num_rows == sub.num_rows
 
 
-def non_empty(df: pd.DataFrame) -> bool:
-    """Check that the DataFrame has at least one row.
+def non_empty(table: pa.Table) -> bool:
+    """Check that the Table has at least one row.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
 
     Returns
     -------
     bool
-        True if the DataFrame is non-empty.
+        True if the Table is non-empty.
     """
-    return len(df) > 0
+    return table.num_rows > 0
 
 
-def row_count_between(df: pd.DataFrame, low: int, high: int) -> bool:
+def row_count_between(table: pa.Table, low: int, high: int) -> bool:
     """Check that the row count falls within [low, high] inclusive.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
     low : int
         Minimum acceptable row count.
     high : int
@@ -691,26 +711,26 @@ def row_count_between(df: pd.DataFrame, low: int, high: int) -> bool:
     Returns
     -------
     bool
-        True if low <= len(df) <= high.
+        True if low <= num_rows <= high.
     """
-    return low <= len(df) <= high
+    return low <= table.num_rows <= high
 
 
-def dtype_is(df: pd.DataFrame, column: str, expected: str) -> bool:
-    """Check that a column's dtype matches the expected string representation.
+def schema_field_is(table: pa.Table, column: str, expected_type: pa.DataType) -> bool:
+    """Check that a column's type matches the expected pyarrow DataType.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        DataFrame to check.
+    table : pa.Table
+        Table to check.
     column : str
         Column name.
-    expected : str
-        Expected dtype string (e.g. "int64", "object", "datetime64[ns]").
+    expected_type : pa.DataType
+        Expected pyarrow type (e.g. pa.int64(), pa.string()).
 
     Returns
     -------
     bool
-        True if the column dtype matches.
+        True if the column type matches.
     """
-    return str(df[column].dtype) == expected
+    return table.schema.field(column).type == expected_type

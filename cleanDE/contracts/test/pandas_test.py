@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from cleanDE.version_contracts.pandas_impl import (
+from cleanDE.contracts.pandas_impl import (
     ContractError,
     ContractSpec,
     Verified,
@@ -853,3 +853,106 @@ class TestSafeUnsafeDistinction:
         assert list(result.inner["doubled"]) == [20, 40]
         assert result.contracts == frozenset({"non_empty", "has_inputs", "has_output"})
         assert result.versions == {"pandas": "3.0.2"}
+
+
+# ── Version-optional usage (the 90% path) ────────────────────────────
+
+
+class TestPureDataContracts:
+    """Contracts without any version requirements — the primary use case."""
+
+    def test_verified_decorator_no_versions(self) -> None:
+        @verified(
+            pre=lambda df: non_empty(df),
+            post=lambda result: columns_present(result, ["a", "out"]),
+        )
+        def transform(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            df["out"] = df["a"] * 2
+            return df
+
+        result = transform(pd.DataFrame({"a": [1, 2]}))
+        assert list(result["out"]) == [2, 4]
+
+    def test_verified_decorator_pre_fails_no_versions(self) -> None:
+        @verified(pre=lambda df: non_empty(df))
+        def transform(df: pd.DataFrame) -> pd.DataFrame:
+            return df
+
+        with pytest.raises(ContractError, match="Precondition"):
+            transform(pd.DataFrame())
+
+    def test_verified_decorator_post_fails_no_versions(self) -> None:
+        @verified(post=lambda result: columns_present(result, ["missing"]))
+        def transform() -> pd.DataFrame:
+            return pd.DataFrame({"a": [1]})
+
+        with pytest.raises(ContractError, match="Postcondition"):
+            transform()
+
+    def test_verified_decorator_metadata_empty_when_no_versions(self) -> None:
+        @verified(pre=lambda x: True)
+        def my_fn(x: int) -> int:
+            return x
+
+        assert my_fn.__version_requirements__ == {}
+        assert my_fn.__locked_versions__ == {}
+
+    def test_verified_require_without_lock_raises(self) -> None:
+        with pytest.raises(ValueError, match="lock_versions must be provided"):
+            @verified(require={"pandas": ">=3.0.0"})
+            def my_fn() -> None:
+                pass
+
+    def test_contract_spec_no_versions(self) -> None:
+        spec = ContractSpec(
+            name="pure_contract",
+            preconditions={"non_empty": lambda df: non_empty(df)},
+            postconditions={"has_cols": lambda r: columns_present(r, ["a", "out"])},
+        )
+
+        def transform(df: pd.DataFrame) -> pd.DataFrame:
+            df = df.copy()
+            df["out"] = df["a"] * 2
+            return df
+
+        safe_fn = spec.wrap(transform)
+        result = safe_fn(pd.DataFrame({"a": [1, 2, 3]}))
+
+        assert isinstance(result, Verified)
+        assert list(result.inner["out"]) == [2, 4, 6]
+        assert "non_empty" in result.contracts
+        assert "has_cols" in result.contracts
+        assert result.versions == {}
+
+    def test_contract_spec_verify_no_versions(self) -> None:
+        spec = ContractSpec(
+            name="input_check",
+            preconditions={
+                "non_empty": lambda df, **kw: non_empty(df),
+                "has_id": lambda df, **kw: columns_present(df, ["id"]),
+            },
+        )
+
+        df = pd.DataFrame({"id": [1, 2], "val": [10, 20]})
+        result = spec.verify(df)
+
+        assert isinstance(result, Verified)
+        assert result.inner is df
+        assert result.versions == {}
+        assert "non_empty" in result.contracts
+        assert "has_id" in result.contracts
+
+    def test_contract_spec_require_without_lock_raises(self) -> None:
+        with pytest.raises(ValueError, match="lock_versions must be provided"):
+            ContractSpec(
+                name="test",
+                require={"pandas": ">=3.0.0"},
+            )
+
+    def test_contract_spec_checked_versions_empty(self) -> None:
+        spec = ContractSpec(
+            name="test",
+            preconditions={"check": lambda x: True},
+        )
+        assert spec.checked_versions == {}

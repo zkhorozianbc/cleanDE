@@ -3,7 +3,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-from cleanDE.version_contracts.pyarrow_impl import (
+from cleanDE.contracts.pyarrow_impl import (
     ContractError,
     ContractSpec,
     Verified,
@@ -753,3 +753,107 @@ class TestSafeUnsafeDistinction:
         assert result.inner.column("doubled").to_pylist() == [20, 40]
         assert result.contracts == frozenset({"non_empty", "has_inputs", "has_output"})
         assert result.versions == {"pyarrow": "23.0.1"}
+
+
+# ── Version-optional usage (the 90% path) ────────────────────────────
+
+
+class TestPureDataContracts:
+    """Contracts without any version requirements — the primary use case."""
+
+    def test_verified_decorator_no_versions(self) -> None:
+        @verified(
+            pre=lambda table: non_empty(table),
+            post=lambda result: columns_present(result, ["a", "out"]),
+        )
+        def transform(table: pa.Table) -> pa.Table:
+            import pyarrow.compute as pc
+
+            return table.append_column("out", pc.multiply(table.column("a"), 2))
+
+        result = transform(pa.table({"a": [1, 2]}))
+        assert result.column("out").to_pylist() == [2, 4]
+
+    def test_verified_decorator_pre_fails_no_versions(self) -> None:
+        @verified(pre=lambda table: non_empty(table))
+        def transform(table: pa.Table) -> pa.Table:
+            return table
+
+        empty = pa.table({"a": pa.array([], type=pa.int64())})
+        with pytest.raises(ContractError, match="Precondition"):
+            transform(empty)
+
+    def test_verified_decorator_post_fails_no_versions(self) -> None:
+        @verified(post=lambda result: columns_present(result, ["missing"]))
+        def transform() -> pa.Table:
+            return pa.table({"a": [1]})
+
+        with pytest.raises(ContractError, match="Postcondition"):
+            transform()
+
+    def test_verified_decorator_metadata_empty_when_no_versions(self) -> None:
+        @verified(pre=lambda x: True)
+        def my_fn(x: int) -> int:
+            return x
+
+        assert my_fn.__version_requirements__ == {}
+        assert my_fn.__locked_versions__ == {}
+
+    def test_verified_require_without_lock_raises(self) -> None:
+        with pytest.raises(ValueError, match="lock_versions must be provided"):
+            @verified(require={"pyarrow": ">=14.0.0"})
+            def my_fn() -> None:
+                pass
+
+    def test_contract_spec_no_versions(self) -> None:
+        spec = ContractSpec(
+            name="pure_contract",
+            preconditions={"non_empty": lambda table: non_empty(table)},
+            postconditions={"has_cols": lambda r: columns_present(r, ["a", "out"])},
+        )
+
+        def transform(table: pa.Table) -> pa.Table:
+            import pyarrow.compute as pc
+
+            return table.append_column("out", pc.multiply(table.column("a"), 2))
+
+        safe_fn = spec.wrap(transform)
+        result = safe_fn(pa.table({"a": [1, 2, 3]}))
+
+        assert isinstance(result, Verified)
+        assert result.inner.column("out").to_pylist() == [2, 4, 6]
+        assert "non_empty" in result.contracts
+        assert "has_cols" in result.contracts
+        assert result.versions == {}
+
+    def test_contract_spec_verify_no_versions(self) -> None:
+        spec = ContractSpec(
+            name="input_check",
+            preconditions={
+                "non_empty": lambda table, **kw: non_empty(table),
+                "has_id": lambda table, **kw: columns_present(table, ["id"]),
+            },
+        )
+
+        table = pa.table({"id": [1, 2], "val": [10, 20]})
+        result = spec.verify(table)
+
+        assert isinstance(result, Verified)
+        assert result.inner is table
+        assert result.versions == {}
+        assert "non_empty" in result.contracts
+        assert "has_id" in result.contracts
+
+    def test_contract_spec_require_without_lock_raises(self) -> None:
+        with pytest.raises(ValueError, match="lock_versions must be provided"):
+            ContractSpec(
+                name="test",
+                require={"pyarrow": ">=14.0.0"},
+            )
+
+    def test_contract_spec_checked_versions_empty(self) -> None:
+        spec = ContractSpec(
+            name="test",
+            preconditions={"check": lambda x: True},
+        )
+        assert spec.checked_versions == {}
