@@ -1,15 +1,17 @@
 """
 Dependency pinning: read a uv.lock file and bind your code to locked versions.
 
-The lock file is a source of truth about your project's dependency versions.
-This pattern makes that truth available to your code so version upgrades that
-violate your assumptions fail at import time, not at 3am in production.
+The lock file is the source of truth about your project's dependency versions.
+This pattern reads it natively — including the requirements your pyproject.toml
+declares — so version upgrades that violate assumptions fail at import time.
 
     from pathlib import Path
     from cleanDE.dep_pin.impl import pin, requires, resolve
 
-    VERSIONS = pin(Path("uv.lock"), {"pandas": ">=3.0", "pyarrow": ">=14.0"})
+    # Reads requirements straight from the lock file (no re-declaration):
+    VERSIONS = pin(Path("uv.lock"))
 
+    # Version-conditional dispatch:
     @requires(pandas=">=3.0")
     def normalize_arrow(df): ...
 
@@ -18,13 +20,14 @@ violate your assumptions fail at import time, not at 3am in production.
 
     normalize = resolve(VERSIONS, normalize_arrow, normalize_numpy)
 
-Six functions:
-  parse_lock  — pure: lock text in, {package: version_tuple} out
-  check       — pure: versions + requirements in, raise or nothing
-  pin         — convenience: file path + requirements in, versions out
-  select      — pure: versions + branches in, first matching value out
-  requires    — decorator: tag a function with version requirements
-  resolve     — pure: versions + tagged candidates in, winner out
+Seven functions:
+  parse_lock        — pure: lock text → {package: version_tuple}
+  parse_requirements — pure: lock text → {package: specifier} from pyproject.toml
+  check             — pure: versions + requirements → raise or nothing
+  pin               — convenience: lock path → versions (reads requirements natively)
+  select            — pure: versions + branches → first matching value
+  requires          — decorator: tag a function with version requirements
+  resolve           — pure: versions + tagged candidates → winner
 """
 
 import tomllib
@@ -81,6 +84,40 @@ def parse_lock(lock_text: str) -> dict[str, tuple[int, ...]]:
     }
 
 
+def parse_requirements(lock_text: str) -> dict[str, str]:
+    """Extract the root package's declared dependency requirements from uv.lock.
+
+    Finds the root package (the one with ``source = { virtual = "." }``)
+    and reads its ``requires-dist`` metadata — the same specifiers declared
+    in pyproject.toml, embedded in the lock file by uv.
+
+    Pure function — no I/O.
+
+    Parameters
+    ----------
+    lock_text : str
+        Contents of a uv.lock file.
+
+    Returns
+    -------
+    dict[str, str]
+        {package_name: specifier}, e.g. {"pandas": ">=3.0.2"}.
+        Only includes dependencies that have a version specifier.
+        Returns empty dict if no root package is found.
+    """
+    data = tomllib.loads(lock_text)
+    for pkg in data.get("package", []):
+        source = pkg.get("source", {})
+        if "virtual" in source:
+            meta = pkg.get("metadata", {})
+            return {
+                dep["name"]: dep["specifier"]
+                for dep in meta.get("requires-dist", [])
+                if "specifier" in dep
+            }
+    return {}
+
+
 def check(
     versions: dict[str, tuple[int, ...]],
     require: dict[str, str],
@@ -112,12 +149,20 @@ def check(
 
 def pin(
     lock_path: Path,
-    require: dict[str, str],
+    require: dict[str, str] | None = None,
 ) -> dict[str, tuple[int, ...]]:
     """Read a uv.lock file, verify requirements, return locked versions.
 
     Convenience that combines file I/O + parse_lock() + check().
-    Intended for module-level use so violations surface at import time:
+    Intended for module-level use so violations surface at import time.
+
+    When *require* is omitted, reads the root package's declared
+    requirements directly from the lock file — no need to re-declare
+    what pyproject.toml already specifies:
+
+        VERSIONS = pin(Path("uv.lock"))
+
+    When *require* is given explicitly, uses those instead:
 
         VERSIONS = pin(Path("uv.lock"), {"pandas": ">=3.0"})
 
@@ -125,8 +170,9 @@ def pin(
     ----------
     lock_path : Path
         Path to the uv.lock file.
-    require : dict[str, str]
-        {package: constraint}.
+    require : dict[str, str] | None
+        {package: constraint}.  If None, reads requirements from the
+        lock file's root package metadata (pyproject.toml specifiers).
 
     Returns
     -------
@@ -140,7 +186,10 @@ def pin(
     DependencyError
         If any requirement is unmet.
     """
-    versions = parse_lock(lock_path.read_text())
+    text = lock_path.read_text()
+    versions = parse_lock(text)
+    if require is None:
+        require = parse_requirements(text)
     check(versions, require)
     return versions
 

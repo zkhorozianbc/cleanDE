@@ -8,6 +8,7 @@ from cleanDE.dep_pin.impl import (
     _satisfies,
     check,
     parse_lock,
+    parse_requirements,
     pin,
     requires,
     resolve,
@@ -19,6 +20,21 @@ version = 1
 requires-python = ">=3.12"
 
 [[package]]
+name = "cleande"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "pandas" },
+    { name = "pyarrow" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "pandas", specifier = ">=3.0.2" },
+    { name = "pyarrow", specifier = ">=23.0.1" },
+]
+
+[[package]]
 name = "pandas"
 version = "3.0.2"
 source = { registry = "https://pypi.org/simple" }
@@ -27,11 +43,6 @@ source = { registry = "https://pypi.org/simple" }
 name = "pyarrow"
 version = "23.0.1"
 source = { registry = "https://pypi.org/simple" }
-
-[[package]]
-name = "cleande"
-version = "0.1.0"
-source = { virtual = "." }
 """
 
 
@@ -72,6 +83,42 @@ class TestParseLock:
             'version = "3.0.0rc1"\n'
         )
         assert parse_lock(text)["beta"] == (3, 0, 0)
+
+
+# ── parse_requirements ───────────────────────────────────────────────
+
+
+class TestParseRequirements:
+    def test_extracts_from_root_package(self) -> None:
+        reqs = parse_requirements(SAMPLE_LOCK)
+        assert reqs["pandas"] == ">=3.0.2"
+        assert reqs["pyarrow"] == ">=23.0.1"
+
+    def test_only_from_virtual_source(self) -> None:
+        # Non-virtual packages' requires-dist should be ignored
+        reqs = parse_requirements(SAMPLE_LOCK)
+        # Only the root package's direct deps, not transitive ones
+        assert "numpy" not in reqs
+
+    def test_no_root_package(self) -> None:
+        text = (
+            'version = 1\n'
+            '[[package]]\n'
+            'name = "pandas"\n'
+            'version = "3.0.2"\n'
+            'source = { registry = "https://pypi.org/simple" }\n'
+        )
+        assert parse_requirements(text) == {}
+
+    def test_root_without_metadata(self) -> None:
+        text = (
+            'version = 1\n'
+            '[[package]]\n'
+            'name = "myproject"\n'
+            'version = "0.1.0"\n'
+            'source = { virtual = "." }\n'
+        )
+        assert parse_requirements(text) == {}
 
 
 # ── _parse_version ───────────────────────────────────────────────────
@@ -180,6 +227,32 @@ class TestPin:
     def test_empty_requirements(self, lock_path: Path) -> None:
         versions = pin(lock_path, {})
         assert "pandas" in versions
+
+    def test_native_reads_from_lock_metadata(self, lock_path: Path) -> None:
+        # No require arg — reads requirements from the lock file itself
+        versions = pin(lock_path)
+        assert versions["pandas"] == (3, 0, 2)
+        assert versions["pyarrow"] == (23, 0, 1)
+
+    def test_native_raises_when_lock_violated(self, tmp_path: Path) -> None:
+        # Lock file says requires pandas>=99.0, but resolves to 3.0.2
+        lock = tmp_path / "uv.lock"
+        lock.write_text(
+            'version = 1\n'
+            '[[package]]\n'
+            'name = "myproject"\n'
+            'version = "0.1.0"\n'
+            'source = { virtual = "." }\n'
+            '[package.metadata]\n'
+            'requires-dist = [\n'
+            '    { name = "pandas", specifier = ">=99.0" },\n'
+            ']\n'
+            '[[package]]\n'
+            'name = "pandas"\n'
+            'version = "3.0.2"\n'
+        )
+        with pytest.raises(DependencyError, match="pandas"):
+            pin(lock)
 
 
 # ── select ───────────────────────────────────────────────────────────
