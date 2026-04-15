@@ -9,6 +9,8 @@ from cleanDE.dep_pin.impl import (
     check,
     parse_lock,
     pin,
+    requires,
+    resolve,
     select,
 )
 
@@ -257,3 +259,142 @@ class TestIntegration:
             "<23.0": "legacy",
         })
         assert label == "modern"
+
+
+# ── requires + resolve ───────────────────────────────────────────────
+
+
+class TestRequires:
+    def test_attaches_requirements(self) -> None:
+        @requires(pandas=">=3.0")
+        def fn() -> None:
+            pass
+
+        assert fn.__requires__ == {"pandas": ">=3.0"}
+
+    def test_multiple_packages(self) -> None:
+        @requires(pandas=">=3.0", pyarrow=">=14.0")
+        def fn() -> None:
+            pass
+
+        assert fn.__requires__ == {"pandas": ">=3.0", "pyarrow": ">=14.0"}
+
+    def test_does_not_change_behavior(self) -> None:
+        @requires(pandas=">=3.0")
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        assert add(2, 3) == 5
+
+    def test_preserves_name(self) -> None:
+        @requires(pandas=">=3.0")
+        def important_function() -> None:
+            pass
+
+        assert important_function.__name__ == "important_function"
+
+
+class TestResolve:
+    def test_picks_matching_candidate(self) -> None:
+        versions = {"pandas": (3, 0, 2)}
+
+        @requires(pandas=">=3.0")
+        def v3(x: int) -> int:
+            return x * 3
+
+        @requires(pandas=">=2.0,<3.0")
+        def v2(x: int) -> int:
+            return x * 2
+
+        fn = resolve(versions, v3, v2)
+        assert fn(10) == 30
+
+    def test_first_match_wins(self) -> None:
+        versions = {"pandas": (3, 0, 2)}
+
+        @requires(pandas=">=2.0")
+        def broad() -> str:
+            return "broad"
+
+        @requires(pandas=">=3.0")
+        def narrow() -> str:
+            return "narrow"
+
+        assert resolve(versions, broad, narrow)() == "broad"
+
+    def test_second_candidate(self) -> None:
+        versions = {"pandas": (2, 5, 0)}
+
+        @requires(pandas=">=3.0")
+        def v3() -> str:
+            return "v3"
+
+        @requires(pandas=">=2.0,<3.0")
+        def v2() -> str:
+            return "v2"
+
+        assert resolve(versions, v3, v2)() == "v2"
+
+    def test_multi_package_constraint(self) -> None:
+        versions = {"pandas": (3, 0, 2), "pyarrow": (23, 0, 1)}
+
+        @requires(pandas=">=3.0", pyarrow=">=23.0")
+        def modern() -> str:
+            return "modern"
+
+        @requires(pandas=">=2.0")
+        def fallback() -> str:
+            return "fallback"
+
+        assert resolve(versions, modern, fallback)() == "modern"
+
+    def test_multi_package_partial_fail(self) -> None:
+        versions = {"pandas": (3, 0, 2), "pyarrow": (10, 0, 0)}
+
+        @requires(pandas=">=3.0", pyarrow=">=23.0")
+        def modern() -> str:
+            return "modern"
+
+        @requires(pandas=">=2.0")
+        def fallback() -> str:
+            return "fallback"
+
+        # modern fails because pyarrow is too old, falls through to fallback
+        assert resolve(versions, modern, fallback)() == "fallback"
+
+    def test_no_match_raises(self) -> None:
+        versions = {"pandas": (1, 0, 0)}
+
+        @requires(pandas=">=2.0")
+        def v2() -> None:
+            pass
+
+        with pytest.raises(ValueError, match="No candidate matches"):
+            resolve(versions, v2)
+
+    def test_untagged_function_always_matches(self) -> None:
+        versions = {"pandas": (1, 0, 0)}
+
+        @requires(pandas=">=3.0")
+        def strict() -> str:
+            return "strict"
+
+        def fallback() -> str:
+            return "fallback"
+
+        # fallback has no __requires__, so it matches anything
+        assert resolve(versions, strict, fallback)() == "fallback"
+
+    def test_pin_then_resolve(self, lock_path: Path) -> None:
+        versions = pin(lock_path, {"pandas": ">=3.0"})
+
+        @requires(pandas=">=3.0")
+        def v3(x: int) -> int:
+            return x * 3
+
+        @requires(pandas=">=2.0,<3.0")
+        def v2(x: int) -> int:
+            return x * 2
+
+        fn = resolve(versions, v3, v2)
+        assert fn(10) == 30

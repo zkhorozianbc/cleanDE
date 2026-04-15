@@ -6,27 +6,33 @@ This pattern makes that truth available to your code so version upgrades that
 violate your assumptions fail at import time, not at 3am in production.
 
     from pathlib import Path
-    from cleanDE.dep_pin.impl import pin, select
+    from cleanDE.dep_pin.impl import pin, requires, resolve
 
     VERSIONS = pin(Path("uv.lock"), {"pandas": ">=3.0", "pyarrow": ">=14.0"})
 
-    # Version-conditional dispatch at module load time
-    normalize = select(VERSIONS, "pandas", {
-        ">=3.0": normalize_arrow_dtypes,
-        ">=2.0,<3.0": normalize_numpy_dtypes,
-    })
+    @requires(pandas=">=3.0")
+    def normalize_arrow(df): ...
 
-Four functions:
+    @requires(pandas=">=2.0,<3.0")
+    def normalize_numpy(df): ...
+
+    normalize = resolve(VERSIONS, normalize_arrow, normalize_numpy)
+
+Six functions:
   parse_lock  — pure: lock text in, {package: version_tuple} out
   check       — pure: versions + requirements in, raise or nothing
   pin         — convenience: file path + requirements in, versions out
   select      — pure: versions + branches in, first matching value out
+  requires    — decorator: tag a function with version requirements
+  resolve     — pure: versions + tagged candidates in, winner out
 """
 
 import tomllib
 from pathlib import Path
-from typing import TypeVar
+from typing import Callable, ParamSpec, TypeVar
 
+P = ParamSpec("P")
+R = TypeVar("R")
 T = TypeVar("T")
 
 
@@ -196,6 +202,82 @@ def select(
         f"{'.'.join(map(str, locked))}; "
         f"branches: {list(branches.keys())}"
     )
+
+
+# ── Version-tagged functions ─────────────────────────────────────────
+
+
+def requires(**deps: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    """Tag a function with the dependency versions it needs.
+
+    Pure annotation — does not change the function's behavior.  Attaches
+    a ``__requires__`` dict for use with resolve().
+
+        @requires(pandas=">=3.0", pyarrow=">=14.0")
+        def transform(df): ...
+
+        transform.__requires__  # {"pandas": ">=3.0", "pyarrow": ">=14.0"}
+
+    Parameters
+    ----------
+    **deps : str
+        Package names to version constraints.
+
+    Returns
+    -------
+    Callable
+        The original function, unchanged, with ``__requires__`` attached.
+    """
+    def decorator(fn: Callable[P, R]) -> Callable[P, R]:
+        fn.__requires__ = deps  # type: ignore[attr-defined]
+        return fn
+    return decorator
+
+
+def resolve(
+    versions: dict[str, tuple[int, ...]],
+    *candidates: Callable[P, R],
+) -> Callable[P, R]:
+    """Pick the first candidate whose @requires are all satisfied.
+
+    Unlike select(), which branches on a single package, resolve() checks
+    every requirement on each candidate — so multi-package constraints
+    work naturally.
+
+        @requires(pandas=">=3.0")
+        def impl_v3(df): ...
+
+        @requires(pandas=">=2.0,<3.0")
+        def impl_v2(df): ...
+
+        impl = resolve(VERSIONS, impl_v3, impl_v2)
+
+    Parameters
+    ----------
+    versions : dict[str, tuple[int, ...]]
+        Locked versions from parse_lock() or pin().
+    *candidates : Callable
+        Functions tagged with @requires.  First match wins.
+
+    Returns
+    -------
+    Callable
+        The first candidate whose requirements are all met.
+
+    Raises
+    ------
+    ValueError
+        If no candidate matches.
+    """
+    for fn in candidates:
+        reqs: dict[str, str] = getattr(fn, "__requires__", {})
+        if all(
+            pkg in versions and _satisfies(versions[pkg], constraint)
+            for pkg, constraint in reqs.items()
+        ):
+            return fn
+    names = [getattr(fn, "__name__", repr(fn)) for fn in candidates]
+    raise ValueError(f"No candidate matches locked versions: {names}")
 
 
 # ── Internal ─────────────────────────────────────────────────────────
